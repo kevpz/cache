@@ -1,0 +1,41 @@
+---
+description: Core project standards and conventions
+alwaysApply: true
+---
+
+# Project Standards
+
+## Core Engineering Principles
+
+**MANDATORY**: Before writing any code, follow these principles:
+
+1. **Think First**: Think carefully and extensively before writing code
+2. **Model Accurately**: Model the problem space as accurately as possible
+3. **Mathematical Rigor**: Follow mathematical and engineering principles
+4. **Simplicity**: Choose the simplest (not easiest) design and implementation always
+5. **Avoid Complexity**: Avoid accidental complexity at all costs
+6. **Code as Liability**: Remember that every line of code is a liability
+
+These principles take precedence over all other guidelines. Code should be minimal, well-thought-out, and solve the actual problem without introducing unnecessary complexity.
+
+## Code Quality
+
+- Write clean, maintainable Go code
+- Follow Go best practices and idioms
+- Run `gofmt`, `golint`, and `go vet` before committing
+- Keep functions focused and single-purpose
+- Handle all errors explicitly
+
+## Documentation
+
+- Update README.md with project setup instructions
+- Document exported functions and packages
+- Include examples in documentation
+- Use `go doc` format for code documentation
+
+## Git Workflow
+
+- Write clear, descriptive commit messages
+- Use conventional commit format when applicable
+- Keep commits focused and atomic
+- Ensure code passes `go test ./...` before committing

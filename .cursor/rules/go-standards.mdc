@@ -1,0 +1,47 @@
+---
+description: Go coding standards and best practices
+globs: **/*.go
+alwaysApply: false
+---
+
+# Go Coding Standards
+
+## Code Style
+
+- Follow `gofmt` formatting standards
+- Use `golint` and `go vet` for code quality
+- Prefer explicit error handling - never ignore errors
+- Use meaningful variable and function names
+
+## Error Handling
+
+```go
+// ❌ BAD - ignoring errors
+result, _ := someFunction()
+
+// ✅ GOOD - handle errors explicitly
+result, err := someFunction()
+if err != nil {
+    return fmt.Errorf("failed to execute: %w", err)
+}
+```
+
+## Package Organization
+
+- Keep packages focused and cohesive
+- Use lowercase package names
+- Export only what needs to be exported (capitalize public APIs)
+- Keep main package minimal - delegate to other packages
+
+## Testing
+
+- Write tests for all exported functions
+- Use table-driven tests when appropriate
+- Name test files `*_test.go`
+- Use `t.Helper()` in test helpers
+
+## Documentation
+
+- Add package-level comments for exported packages
+- Document all exported functions, types, and variables
+- Use `go doc` format for documentation
