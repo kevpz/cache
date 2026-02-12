@@ -29,15 +29,35 @@ func populateFrom(s Store, keys []string) {
 }
 
 // makeZipfIndices pre-generates n indices in [0, keyCount) following
-// Zipf(s=1.01) distribution. Pre-computing avoids RNG overhead in hot loop.
-func makeZipfIndices(n, keyCount int) []int {
+// Zipf(s=skew) distribution. Pre-computing avoids RNG overhead in hot loop.
+func makeZipfIndices(n, keyCount int, skew float64) []int {
 	r := rand.New(rand.NewSource(42))
-	z := rand.NewZipf(r, 1.01, 1, uint64(keyCount-1))
+	z := rand.NewZipf(r, skew, 1, uint64(keyCount-1))
 	indices := make([]int, n)
 	for i := range indices {
 		indices[i] = int(z.Uint64())
 	}
 	return indices
+}
+
+// makeProdKeys generates n keys with namespace prefixes (~25 bytes each),
+// matching production key sizes (Twitter OSDI'20: 20-100 bytes with "ns1:ns2:obj").
+func makeProdKeys(n int) []string {
+	ks := make([]string, n)
+	for i := range ks {
+		ks[i] = fmt.Sprintf("ns:cache:obj:%08d", i)
+	}
+	return ks
+}
+
+// prodVal is a 200-byte value matching production median object size
+// (Twitter OSDI'20: median ~230 bytes).
+var prodVal = string(make([]byte, 200))
+
+func populateWithVal(s Store, keys []string, val string) {
+	for _, k := range keys {
+		s.Set(k, val)
+	}
 }
 
 var factories = []struct {
@@ -132,24 +152,30 @@ func BenchmarkDeleteMiss(b *testing.B) {
 }
 
 // --- B. Production Workloads ---
-// Model real access skew using Zipf(s=1.01) key distribution and
-// operation ratios from published production analyses (Twitter OSDI'20,
-// Facebook SIGMETRICS).
+// Model real access skew using Zipf key distribution and operation ratios
+// from published production analyses (Twitter OSDI'20, Facebook SIGMETRICS).
+//
+// Uses production-sized keys (~25 bytes with namespace prefix) and
+// values (200 bytes, matching Twitter OSDI'20 median of ~230 bytes).
+// This exposes the true cost of slab-copy reads (LRUStore, StaticMap)
+// vs zero-copy pointer returns (HashTrieStore, SyncMapStore).
 
 const (
 	prodKeyCount   = 100_000
 	zipfIndexCount = 10_000_000
+	defaultSkew    = 1.01 // conservative; production often 1.0-1.5+
+	highSkew       = 1.5  // "very high skew" observed in production (Twitter OSDI'20)
 )
 
-func benchProduction(b *testing.B, getPct, setPct, delPct int) {
-	keys := makeKeys(prodKeyCount)
-	indices := makeZipfIndices(zipfIndexCount, prodKeyCount)
+func benchProduction(b *testing.B, getPct, setPct, delPct int, skew float64) {
+	keys := makeProdKeys(prodKeyCount)
+	indices := makeZipfIndices(zipfIndexCount, prodKeyCount, skew)
 	total := getPct + setPct + delPct
 
 	for _, f := range factories {
 		b.Run(f.name, func(b *testing.B) {
 			s := f.new()
-			populateFrom(s, keys)
+			populateWithVal(s, keys, prodVal)
 			// Prime to steady state.
 			for i := 0; i < prodKeyCount*2; i++ {
 				s.Get(keys[i%prodKeyCount])
@@ -168,7 +194,7 @@ func benchProduction(b *testing.B, getPct, setPct, delPct int) {
 					if op < getPct {
 						s.Get(k)
 					} else if op < getPct+setPct {
-						s.Set(k, "value")
+						s.Set(k, prodVal)
 					} else {
 						s.Delete(k)
 					}
@@ -180,18 +206,32 @@ func benchProduction(b *testing.B, getPct, setPct, delPct int) {
 }
 
 // 97% Get, 2% Set, 1% Delete. Facebook storage cache workload.
+// Zipf s=1.01 (conservative skew).
 func BenchmarkProductionStorage(b *testing.B) {
-	benchProduction(b, 97, 2, 1)
+	benchProduction(b, 97, 2, 1, defaultSkew)
 }
 
 // 80% Get, 15% Set, 5% Delete. General-purpose cache.
 func BenchmarkProductionMixed(b *testing.B) {
-	benchProduction(b, 80, 15, 5)
+	benchProduction(b, 80, 15, 5, defaultSkew)
 }
 
 // 40% Get, 40% Set, 20% Delete. Twitter write-heavy cluster.
 func BenchmarkProductionWriteHeavy(b *testing.B) {
-	benchProduction(b, 40, 40, 20)
+	benchProduction(b, 40, 40, 20, defaultSkew)
+}
+
+// High-skew variants (Zipf s=1.5). Twitter OSDI'20 reports many clusters
+// are "far more skewed than previously shown." Higher skew concentrates
+// traffic on fewer keys, increasing shard contention for mutex-based stores
+// and widening HashTrieStore's lock-free read advantage.
+
+func BenchmarkProductionStorage_HighSkew(b *testing.B) {
+	benchProduction(b, 97, 2, 1, highSkew)
+}
+
+func BenchmarkProductionMixed_HighSkew(b *testing.B) {
+	benchProduction(b, 80, 15, 5, highSkew)
 }
 
 // --- C. Stress Tests ---
@@ -418,7 +458,7 @@ func scaleKey(i int) string {
 
 func BenchmarkScale4GB_Production(b *testing.B) {
 	val := string(make([]byte, scale4GBValSize))
-	indices := makeZipfIndices(zipfIndexCount, scale4GBKeyCount)
+	indices := makeZipfIndices(zipfIndexCount, scale4GBKeyCount, defaultSkew)
 
 	impls := []struct {
 		name string
