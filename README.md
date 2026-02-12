@@ -1,169 +1,120 @@
 # Cache
 
-An in-memory key-value cache microservice with HTTP REST API, written in Go. Designed for deployment in microservice architectures with capacity for 32GB of data.
+In-memory key-value cache in Go. Five concurrent store implementations benchmarked against production workload research from Facebook and Twitter. Served via HTTP REST.
 
-## Features
+## Research-Driven Benchmarks
 
-- SIEVE eviction algorithm (NSDI'24) -- better miss ratio and throughput than LRU
-- Arena-allocated storage with near-zero GC pressure (~768 GC objects for 32GB of data)
-- 256-shard design for low lock contention
-- Pointer-free data structures (`map[uint64]uint32`, scalar-only slots, byte slabs)
-- Health check and cache statistics endpoints
-- Graceful shutdown (SIGTERM/SIGINT)
-- Configuration via environment variables (12-factor)
-- Docker support with `GOMEMLIMIT` tuning
-- No external dependencies (standard library only)
+Benchmark parameters are grounded in published production traces, not synthetic assumptions:
 
-## Getting Started
+| Parameter | Our Benchmark | Source |
+|---|---|---|
+| Operation mix | 97% Get / 2% Set / 1% Delete | Facebook GET:SET = 30:1 ([SIGMETRICS 2012](https://dl.acm.org/doi/10.1145/2254756.2254766)) |
+| Key popularity | Zipf s=1.01 and s=1.5 | Twitter: "approximate Zipfian, sometimes very high skew" ([OSDI 2020](https://www.usenix.org/conference/osdi20/presentation/yang)) |
+| Value size | 200 bytes | Twitter: median ~230 bytes |
+| Key size | ~25 bytes (namespace prefix) | Twitter: 20-100 bytes |
+| Eviction | SIEVE algorithm | [NSDI 2024](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo): better miss ratio than LRU on 45%+ of 1559 traces |
 
-### Prerequisites
+Full methodology, contention analysis, and data gaps documented in [`store/BENCHMARKS.md`](store/BENCHMARKS.md).
 
-- Go 1.24 or later
+### Results: Production Storage Workload (97/2/1 Zipf)
 
-### Running
+**Default skew (s=1.01):**
+
+| Implementation | ns/op | B/op | Strategy |
+|---|---|---|---|
+| **HashTrieStore** | **16** | 0 | Lock-free reads, zero-copy returns |
+| SyncMapStore | 17 | 1 | Lock-free reads, interface boxing |
+| StaticMap | 66 | 144 | DOD open addressing, slab copy |
+| LRUStore | 83 | 153 | SIEVE eviction, slab copy |
+| MutexStore | 126 | 0 | Single RWMutex |
+
+**High skew (s=1.5) -- closer to many production clusters:**
+
+| Implementation | ns/op | B/op |
+|---|---|---|
+| **HashTrieStore** | **13** | 0 |
+| SyncMapStore | 15 | 1 |
+| MutexStore | 93 | 0 |
+| StaticMap | 118 | 123 |
+| LRUStore | 154 | 134 |
+
+HashTrieStore is **9x faster** than LRUStore under high skew. The `B/op` column shows the cost of copying 200-byte values from byte slabs -- invisible at toy value sizes, dominant at production sizes.
+
+### The 32GB Trade-Off
+
+Per-operation throughput is dwarfed by HTTP latency (~1-5 us per request vs 13-154 ns per cache op). At 32GB, the real question is GC:
+
+- **HashTrieStore**: ~100M pointer-bearing heap objects. GC must scan all of them.
+- **LRUStore / StaticMap**: ~768 GC objects. Pointer-free data structures (`map[uint64]uint32`, scalar-only slots, `[]byte` slabs). GC is effectively free.
+
+## Store Implementations
+
+| Implementation | Concurrency | Eviction | GC at 32GB | Best for |
+|---|---|---|---|---|
+| **LRUStore** | Sharded mutex (256) | SIEVE | ~768 objects | Production: bounded memory |
+| **StaticMap** | Sharded mutex (256) | None | ~768 objects | Writes, mixed ops |
+| **HashTrieStore** | Lock-free reads | None | ~100M objects | Max read throughput |
+| **SyncMapStore** | Lock-free reads | None | ~100M objects | Baseline |
+| **MutexStore** | Single RWMutex | None | ~3 objects | Simplicity |
+
+**LRUStore** -- Arena-allocated sharded SIEVE cache. On hit: set a visited bit (no list reordering). On eviction: hand pointer scans, gives visited entries a second chance. All key/value bytes in pre-allocated `[]byte` slabs.
+
+**StaticMap** -- Data Oriented Design. Open addressing with linear probing, backward-shift deletion (no tombstones). SoA layout: `[]uint64` probe array (8 hashes per cache line) separate from `[]entry` payload. All memory pre-allocated.
+
+**HashTrieStore** -- Generic `HashTrieMap[string, string]` extracted from Go's `internal/sync.HashTrieMap`. Lock-free reads via atomic pointer traversal. Zero-copy returns.
+
+## Quick Start
 
 ```bash
-go run ./cmd/
+go run ./cmd/                    # run
+go test -race ./...              # test
+go test -bench=Production -benchmem ./store/  # benchmark
 ```
 
-### Building
+### API
 
-```bash
-go build -o cache ./cmd/
-./cache
 ```
+PUT    /key/{key}   # store (body = value)
+GET    /key/{key}   # retrieve (200 or 404)
+DELETE /key/{key}   # delete (idempotent)
+GET    /health      # {"status":"ok"}
+GET    /stats       # entries, bytes, hits, misses, evictions, hit_rate
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `CACHE_PORT` | `:8080` | Listen address |
+| `CACHE_MAX_BYTES` | `34359738368` (32GB) | Maximum cache size |
 
 ### Docker
 
 ```bash
 docker build -t cache .
-docker run -p 8080:8080 -e CACHE_MAX_BYTES=34359738368 cache
+docker run -p 8080:8080 cache
 ```
 
-### Testing
-
-```bash
-go test ./...
-go test -race ./...
-```
-
-### Benchmarks
-
-```bash
-# Production workload (97/2/1 Zipf)
-go test -bench=Production -benchmem -count=3 ./store/
-
-# All benchmarks
-go test -bench=. -benchmem -count=1 ./store/
-
-# 4GB scale benchmark (requires ~8GB RAM, takes several minutes)
-go test -bench=Scale4GB -benchmem -benchtime=10s -timeout=600s ./store/
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `CACHE_PORT` | `:8080` | Listen address |
-| `CACHE_MAX_BYTES` | `34359738368` (32GB) | Maximum cache size in bytes |
-
-## API
-
-### PUT /key/{key}
-
-Store a value.
-
-```bash
-curl -X PUT http://localhost:8080/key/mykey -d "myvalue"
-# 200 OK
-```
-
-### GET /key/{key}
-
-Retrieve a value.
-
-```bash
-curl http://localhost:8080/key/mykey
-# 200 OK: myvalue
-# 404 Not Found: {"error":"key not found"}
-```
-
-### DELETE /key/{key}
-
-Delete a value. Idempotent (returns 200 even if key doesn't exist).
-
-```bash
-curl -X DELETE http://localhost:8080/key/mykey
-# 200 OK
-```
-
-### GET /health
-
-Health check.
-
-```bash
-curl http://localhost:8080/health
-# {"status":"ok"}
-```
-
-### GET /stats
-
-Cache statistics.
-
-```bash
-curl http://localhost:8080/stats
-# {"entries":1000,"bytes":128000,"max_bytes":34359738368,"hits":9500,"misses":500,"evictions":100,"hit_rate":0.95}
-```
-
-## Architecture
+## Project Structure
 
 ```
-.
-├── cmd/
-│   └── main.go              # Entry point: config, LRUStore, graceful shutdown
-├── server/
-│   ├── server.go            # HTTP handlers: /key/, /health, /stats
-│   └── server_test.go       # HTTP handler tests
-├── store/
-│   ├── store.go             # Store interface (Get, Set, Delete)
-│   ├── lru.go               # Production store: arena-allocated sharded SIEVE cache
-│   ├── lru_test.go          # SIEVE cache tests
-│   ├── hashtrie.go          # HashTrieStore: typed concurrent hash trie
-│   ├── syncmap.go           # SyncMapStore: sync.Map wrapper
-│   ├── bench_test.go        # Comprehensive benchmarks (serial, production, stress, scaling)
-│   ├── store_test.go        # Store interface conformance tests
-│   └── BENCHMARKS.md        # Benchmark design documentation
-├── sync/
-│   └── map.go               # Generic HashTrieMap[K,V] extracted from Go internals
-├── Dockerfile
-├── go.mod
-└── README.md
+cmd/main.go           Entry point, config, graceful shutdown
+server/server.go      HTTP handlers
+store/
+  store.go            Store interface (Get, Set, Delete)
+  hash.go             Shared: fnv1a, sharding constants
+  mutex.go            MutexStore
+  syncmap.go          SyncMapStore
+  hashtrie.go         HashTrieStore + HashTrieMap[K,V]
+  lru.go              LRUStore (SIEVE eviction)
+  static.go           StaticMap (DOD open addressing)
+  bench_test.go       Benchmarks
+  BENCHMARKS.md       Research, methodology, results
 ```
 
-## Store Implementations
+## References
 
-Four implementations of the `Store` interface, each with different trade-offs:
-
-| Implementation | Concurrency | Eviction | GC at 32GB | Best for |
-|---|---|---|---|---|
-| **LRUStore** | Sharded mutex (256) | SIEVE | ~768 objects | Production (bounded memory) |
-| **HashTrieStore** | Lock-free reads | None | ~100M objects | Unbounded caches, max read throughput |
-| **SyncMapStore** | Lock-free reads | None | ~100M objects | Benchmarking baseline |
-| **MutexStore** | Single RWMutex | None | ~3 objects | Simplicity, low entry counts |
-
-### LRUStore (Production)
-
-Arena-allocated sharded cache with SIEVE eviction (NSDI'24). The index map uses `map[uint64]uint32` (scalar-only, GC-invisible). Slot arrays contain no pointers. All key/value bytes live in pre-allocated `[]byte` slabs. On cache hit, only a `visited` bit is set -- no list reordering. Eviction scans from a hand pointer, giving visited entries a second chance.
-
-### HashTrieStore
-
-Typed generic `HashTrieMap[string, string]` extracted from Go's `internal/sync.HashTrieMap`. Uses `hash/maphash.WriteComparable` for hashing and `reflect` for value equality, replacing internal dependencies (`abi`, `goarch`, `race`) with public equivalents. Lock-free reads, fine-grained locking on writes.
-
-## Design Principles
-
-- Think carefully before writing code
-- Model the problem space accurately
-- Follow mathematical and engineering principles
-- Choose the simplest (not easiest) design
-- Avoid accidental complexity
-- Every line of code is a liability
+1. Yang et al. ["In-memory cache clusters at Twitter."](https://www.usenix.org/conference/osdi20/presentation/yang) OSDI 2020. [Traces](https://github.com/twitter/cache-trace).
+2. Atikoglu et al. ["Workload analysis of a large-scale key-value store."](https://dl.acm.org/doi/10.1145/2254756.2254766) SIGMETRICS 2012.
+3. Nishtala et al. ["Scaling Memcache at Facebook."](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) NSDI 2013.
+4. Zhang et al. ["SIEVE is Simpler than LRU."](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo) NSDI 2024.
